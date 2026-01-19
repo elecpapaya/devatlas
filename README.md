@@ -20,27 +20,19 @@ Output:
 
 Defaults:
 - `job-cd` omitted: built-in developer job codes are used.
-- `updated-min/max` omitted: last run window is used if `data/run_state.json` exists, otherwise last 24 hours.
+- `updated-min/max` omitted: last 24 hours window is used.
 - `current-days`: 21
-- `refetch-days`: 7
 - `min-interval-ms`: 200
 - `retry-attempts`: 3
 - `retry-base-ms`: 500
 - `retry-max-ms`: 5000
 
-## Schedule
-```powershell
-go run .\cmd\devatlas -schedule
-```
+## GitHub Actions
+This repo runs collection and deployment in GitHub Actions.
 
-Notes:
-- Daily schedule runs at `00:10` local time by default (`-schedule-at HH:MM`).
-- Successful runs update `data/run_state.json` (used for the next window).
-- A refetch window runs on automatic schedules to recover missed updates (`-refetch-days`).
+Required secret:
+- `SARAMIN_ACCESS_KEY`
 
-## GitHub Pages deploy
-```powershell
-$env:PAGES_REPO_URL="https://github.com/elecpapaya/devatlas.git"
-$env:PAGES_BRANCH="gh-pages"
-powershell -File .\scripts\deploy-pages.ps1
-```
+Workflow:
+- `.github/workflows/collect.yml`
+  - Runs daily at 00:10 KST (cron 10 15 * * *).

@@ -7,17 +7,13 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"os/signal"
 	"path/filepath"
-	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"devatlas/aggregate"
 	"devatlas/geocode"
 	"devatlas/mapper"
-	"devatlas/runstate"
 	"devatlas/saramin"
 )
 
@@ -25,13 +21,8 @@ const (
 	outputPath          = "data/region_counts.json"
 	latestCompaniesPath = "data/latest_companies.json"
 	missingRegionPath   = "data/region_missing.jsonl"
-	statePath           = "data/run_state.json"
 	defaultWindow       = 24 * time.Hour
-	defaultRefetchDays  = 7
 	defaultCurrentDays  = 21
-	defaultScheduleAt   = "00:10"
-	maxRunRetry         = 3
-	runRetryBaseDelay   = 2 * time.Minute
 	defaultMinInterval  = 200 * time.Millisecond
 	defaultRetryBase    = 500 * time.Millisecond
 	defaultRetryMax     = 5 * time.Second
@@ -40,16 +31,13 @@ const (
 )
 
 type runConfig struct {
-	accessKey     string
-	jobCodes      []string
-	updatedMinSet bool
-	updatedMaxSet bool
-	updatedMin    int64
-	updatedMax    int64
-	refetchWindow time.Duration
-	minInterval   time.Duration
-	retry         saramin.RetryConfig
-	currentDays   int
+	accessKey   string
+	jobCodes    []string
+	updatedMin  int64
+	updatedMax  int64
+	minInterval time.Duration
+	retry       saramin.RetryConfig
+	currentDays int
 }
 
 type runResult struct {
@@ -110,9 +98,6 @@ func main() {
 		jobCd         = flag.String("job-cd", "", "Comma-separated job codes")
 		updatedMin    = flag.Int64("updated-min", 0, "Updated min (unix seconds)")
 		updatedMax    = flag.Int64("updated-max", 0, "Updated max (unix seconds)")
-		schedule      = flag.Bool("schedule", false, "Run daily schedule loop")
-		scheduleAt    = flag.String("schedule-at", defaultScheduleAt, "Daily run time (HH:MM, local time)")
-		refetchDays   = flag.Int("refetch-days", defaultRefetchDays, "Refetch window in days for auto runs")
 		currentDays   = flag.Int("current-days", defaultCurrentDays, "Current hiring window in days")
 		minIntervalMs = flag.Int("min-interval-ms", int(defaultMinInterval.Milliseconds()), "Minimum interval between API calls in ms")
 		retryAttempts = flag.Int("retry-attempts", defaultRetryMaxTry, "Max retry attempts for API calls")
@@ -136,14 +121,11 @@ func main() {
 	}
 
 	cfg := runConfig{
-		accessKey:     key,
-		jobCodes:      jobCodes,
-		updatedMinSet: *updatedMin > 0,
-		updatedMaxSet: *updatedMax > 0,
-		updatedMin:    *updatedMin,
-		updatedMax:    *updatedMax,
-		refetchWindow: time.Duration(max(0, *refetchDays)) * 24 * time.Hour,
-		minInterval:   time.Duration(max(0, *minIntervalMs)) * time.Millisecond,
+		accessKey:   key,
+		jobCodes:    jobCodes,
+		updatedMin:  *updatedMin,
+		updatedMax:  *updatedMax,
+		minInterval: time.Duration(max(0, *minIntervalMs)) * time.Millisecond,
 		retry: saramin.RetryConfig{
 			MaxAttempts: max(1, *retryAttempts),
 			BaseDelay:   time.Duration(max(0, *retryBaseMs)) * time.Millisecond,
@@ -154,18 +136,7 @@ func main() {
 
 	applyRetryDefaults(&cfg)
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	if *schedule {
-		if err := scheduleDaily(ctx, cfg, *scheduleAt); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		return
-	}
-
-	result, err := runOnce(ctx, cfg, time.Now())
+	result, err := runOnce(context.Background(), cfg, time.Now())
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -366,7 +337,7 @@ func containsRemoteKeyword(value string) bool {
 
 func runOnce(ctx context.Context, cfg runConfig, now time.Time) (runResult, error) {
 	started := time.Now()
-	windowStart, windowEnd, useAuto, err := resolveWindow(cfg, now)
+	windowStart, windowEnd, err := resolveWindow(cfg, now)
 	if err != nil {
 		return runResult{}, err
 	}
@@ -404,16 +375,6 @@ func runOnce(ctx context.Context, cfg runConfig, now time.Time) (runResult, erro
 	}
 
 	missingCount := missing
-	if useAuto {
-		refetchStart := now.Add(-cfg.refetchWindow)
-		refetchPages, refetchJobs, refetchMissing, err := collectWindow(ctx, client, baseParams, refetchStart, windowEnd, regionAgg, companyAgg, geo.resolver, observedAt, missingRegionIDs, &issues)
-		if err != nil {
-			return runResult{}, err
-		}
-		pages += refetchPages
-		jobs += refetchJobs
-		missingCount += refetchMissing
-	}
 
 	stats := regionAgg.Results()
 	meta := regionCountsMeta{
@@ -439,12 +400,6 @@ func runOnce(ctx context.Context, cfg runConfig, now time.Time) (runResult, erro
 		}
 	}
 
-	if useAuto {
-		if err := runstate.Save(statePath, &runstate.State{LastRunAt: windowEnd}); err != nil {
-			return runResult{}, err
-		}
-	}
-
 	return runResult{
 		pages:          pages,
 		jobs:           jobs,
@@ -453,38 +408,26 @@ func runOnce(ctx context.Context, cfg runConfig, now time.Time) (runResult, erro
 	}, nil
 }
 
-func resolveWindow(cfg runConfig, now time.Time) (time.Time, time.Time, bool, error) {
-	if cfg.updatedMinSet || cfg.updatedMaxSet {
-		var start, end time.Time
-		if cfg.updatedMinSet {
-			start = time.Unix(cfg.updatedMin, 0)
-		}
-		if cfg.updatedMaxSet {
-			end = time.Unix(cfg.updatedMax, 0)
-		}
-		if start.IsZero() {
-			start = end.Add(-defaultWindow)
-		}
-		if end.IsZero() {
-			end = now
-		}
-		if !start.Before(end) {
-			start = end.Add(-defaultWindow)
-		}
-		return start, end, false, nil
+func resolveWindow(cfg runConfig, now time.Time) (time.Time, time.Time, error) {
+	var start, end time.Time
+	if cfg.updatedMin > 0 {
+		start = time.Unix(cfg.updatedMin, 0)
 	}
-
-	state, err := runstate.Load(statePath)
-	if err != nil {
-		return time.Time{}, time.Time{}, false, err
+	if cfg.updatedMax > 0 {
+		end = time.Unix(cfg.updatedMax, 0)
 	}
-	if state.LastRunAt.IsZero() {
-		return now.Add(-defaultWindow), now, true, nil
+	if start.IsZero() && end.IsZero() {
+		end = now
+		start = now.Add(-defaultWindow)
+	} else if start.IsZero() && !end.IsZero() {
+		start = end.Add(-defaultWindow)
+	} else if !start.IsZero() && end.IsZero() {
+		end = now
 	}
-	if !state.LastRunAt.Before(now) {
-		return now.Add(-defaultWindow), now, true, nil
+	if !start.Before(end) {
+		start = end.Add(-defaultWindow)
 	}
-	return state.LastRunAt, now, true, nil
+	return start, end, nil
 }
 
 func collectWindow(
@@ -564,87 +507,6 @@ func collectWindow(
 	return pages, jobs, missing, nil
 }
 
-func scheduleDaily(ctx context.Context, cfg runConfig, scheduleAt string) error {
-	hour, minute, err := parseScheduleAt(scheduleAt)
-	if err != nil {
-		return err
-	}
-	for {
-		next := nextRunTime(time.Now(), hour, minute)
-		if err := sleepUntil(ctx, next); err != nil {
-			return err
-		}
-		if err := runWithRetry(ctx, cfg); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-		}
-	}
-}
-
-func runWithRetry(ctx context.Context, cfg runConfig) error {
-	var lastErr error
-	for attempt := 1; attempt <= maxRunRetry; attempt++ {
-		_, err := runOnce(ctx, cfg, time.Now())
-		if err == nil {
-			return nil
-		}
-		lastErr = err
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		delay := runRetryBaseDelay * time.Duration(attempt)
-		if err := sleepWithContext(ctx, delay); err != nil {
-			return err
-		}
-	}
-	return lastErr
-}
-
-func parseScheduleAt(value string) (int, int, error) {
-	parts := strings.Split(value, ":")
-	if len(parts) != 2 {
-		return 0, 0, fmt.Errorf("invalid schedule-at format: %s", value)
-	}
-	hour, err := strconv.Atoi(parts[0])
-	if err != nil || hour < 0 || hour > 23 {
-		return 0, 0, fmt.Errorf("invalid schedule-at hour: %s", value)
-	}
-	minute, err := strconv.Atoi(parts[1])
-	if err != nil || minute < 0 || minute > 59 {
-		return 0, 0, fmt.Errorf("invalid schedule-at minute: %s", value)
-	}
-	return hour, minute, nil
-}
-
-func nextRunTime(now time.Time, hour, minute int) time.Time {
-	next := time.Date(now.Year(), now.Month(), now.Day(), hour, minute, 0, 0, now.Location())
-	if !next.After(now) {
-		next = next.Add(24 * time.Hour)
-	}
-	return next
-}
-
-func sleepUntil(ctx context.Context, target time.Time) error {
-	delay := time.Until(target)
-	if delay <= 0 {
-		return nil
-	}
-	return sleepWithContext(ctx, delay)
-}
-
-func sleepWithContext(ctx context.Context, delay time.Duration) error {
-	if delay <= 0 {
-		return nil
-	}
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
-}
-
 func applyRetryDefaults(cfg *runConfig) {
 	if cfg == nil {
 		return
@@ -660,9 +522,6 @@ func applyRetryDefaults(cfg *runConfig) {
 	}
 	if cfg.retry.MaxDelay <= 0 {
 		cfg.retry.MaxDelay = defaultRetryMax
-	}
-	if cfg.refetchWindow <= 0 {
-		cfg.refetchWindow = time.Duration(defaultRefetchDays) * 24 * time.Hour
 	}
 	cfg.retry.StatusCodes = map[int]struct{}{
 		429: {},
